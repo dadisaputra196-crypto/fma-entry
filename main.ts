@@ -49,7 +49,7 @@
 //   main.ts            this server: the brief, the catalog, the routes, the register and the poll.
 //   lib/providers.ts   the brief's types and parser, the auth headers, the catalog probe.
 //   lib/wire.ts        Anthropic <-> Chat Completions translation and the SSE writers.
-//   LICENSE            MIT: keep it or replace it with another OSI-approved license.
+//   lib/wire2.ts       cross-wire request/response conversion for anthropic- and gemini-wire upstreams.
 
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 import {
@@ -232,7 +232,7 @@ async function callProviderAnyWire(route: Route, clientBody: Json, clientWire: '
     if (body.stream === true) body.stream = true;
     return fetch(`${base}/v1/messages`, { method: 'POST', headers, body: JSON.stringify(body) });
   }
-  // gemini
+  // gemini: the model rides in the URL path, so there is no body rewrite for the model field.
   const { body, modelId } = geminiBodyFromOpenAI(clientBody, model);
   return fetch(`${base}/v1beta/models/${encodeURIComponent(modelId)}:generateContent`, { method: 'POST', headers, body: JSON.stringify(body) });
 }
@@ -270,7 +270,13 @@ async function pipeStream(stream: ReadableStream<Uint8Array>, res: ServerRespons
   }
 }
 
-/** POST /v1/chat/completions: an OpenAI-shaped client, answered by an openai-wire provider. */
+/**
+ * POST /v1/chat/completions: an OpenAI-shaped client, answered over failover.
+ * Walks the ranked routes until one upstream accepts; a refusal (402, 429, 5xx)
+ * or a thrown fetch costs nothing but moves to the next candidate. Same-wire
+ * streams pipe through; cross-wire answers are translated, then either sent as
+ * one JSON document or re-serialized as a three-chunk SSE sequence.
+ */
 /** Whether an upstream status is a refusal we should fail over from. */
 function isRefusal(status: number): boolean {
   return status === 402 || status === 429 || status >= 500;
@@ -303,6 +309,8 @@ async function chat(req: IncomingMessage, res: ServerResponse): Promise<void> {
     }
     const text = await upstream.text();
     if (upstream.ok && route.probe.provider.wire !== 'openai') {
+      // Cross-wire upstream: translate its answer into OpenAI's response shape,
+      // and synthesize a minimal SSE sequence when the client asked to stream.
       let parsed: unknown;
       try { parsed = JSON.parse(text); } catch { parsed = {}; }
       let out: Json;
@@ -357,6 +365,7 @@ async function messages(req: IncomingMessage, res: ServerResponse): Promise<void
       continue;
     }
     if (body.stream === true && upstream.ok && upstream.body !== null && route.probe.provider.wire === 'openai') {
+      // Same wire upstream: its SSE events translate to Anthropic events one for one.
       res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache', connection: 'keep-alive' });
       for await (const event of anthropicEventsFromOpenAI(upstream.body, requested || model)) res.write(event);
       res.end();

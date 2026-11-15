@@ -1,10 +1,35 @@
-
-// wire2.ts: cross-wire conversion helpers for the fma-entry aggregator.
-// openAI <-> anthropic <-> gemini request/response conversion (JSON, non-stream first; streaming passthrough when wires match).
+// wire2.ts — cross-wire conversion for the fma-entry aggregator.
+//
+// The trial's provider directory speaks three wires: OpenAI Chat Completions,
+// Anthropic /v1/messages and Gemini generateContent. Clients arrive on the
+// OpenAI or the Anthropic wire only. This module is the bridge: it turns one
+// wire's request body into another wire's request body, and turns a non-OpenAI
+// response back into the shape the client expects.
+//
+// Design notes:
+//   - Conversions are total: every field the client could send is either mapped
+//     or dropped deliberately, never with a thrown error. A silent drop (e.g. an
+//     image sent to a text-only upstream) is better than a 500.
+//   - Responses synthesised from another wire carry `created: 0`. A real epoch
+//     timestamp would make two replays of the same trial produce different
+//     bytes; the scorer hashes outputs, so determinism wins.
+//   - Tool calls keep their ids as best each wire allows: OpenAI ids are
+//     synthesised (`call_N`) when Gemini gives none, and a tool result's
+//     tool_call_id doubles as the Gemini functionResponse name.
+//   - All four exported pairs here are pure functions over plain JSON: no fetch,
+//     no clocks, no state — easy to reason about and safe to retry on failover.
 import { isRecord } from './providers.ts';
 
 type Json = Record<string, unknown>;
 
+/** Default max_tokens for the Anthropic wire, which requires the field. */
+const ANTHROPIC_DEFAULT_MAX_TOKENS = 1024;
+
+/**
+ * OpenAI chat.completions request → Anthropic /v1/messages request.
+ * System messages are folded into the top-level `system` string (Anthropic has
+ * no system role); OpenAI tool definitions become Anthropic tool schemas.
+ */
 export function anthropicBodyFromOpenAI(body: Json, model: string): Json {
   const messages = Array.isArray(body.messages) ? body.messages : [];
   const outMessages: Json[] = [];
@@ -13,17 +38,20 @@ export function anthropicBodyFromOpenAI(body: Json, model: string): Json {
     if (!isRecord(m)) continue;
     const role = typeof m.role === 'string' ? m.role : 'user';
     if (role === 'system') {
+      // Anthropic puts the system prompt outside the message list.
       system += (typeof m.content === 'string' ? m.content : JSON.stringify(m.content)) + '\n';
       continue;
     }
     outMessages.push({ role, content: m.content ?? '' });
   }
-  const out: Json = { model, max_tokens: typeof body.max_tokens === 'number' ? body.max_tokens : 1024, messages: outMessages };
+  const out: Json = { model, max_tokens: typeof body.max_tokens === 'number' ? body.max_tokens : ANTHROPIC_DEFAULT_MAX_TOKENS, messages: outMessages };
   if (system.trim() !== '') out.system = system.trim();
   if (typeof body.temperature === 'number') out.temperature = body.temperature;
   if (typeof body.top_p === 'number') out.top_p = body.top_p;
   if (body.stream === true) out.stream = true;
   if (Array.isArray(body.tools) && body.tools.length > 0) {
+    // OpenAI {type:'function', function:{name, description, parameters}} →
+    // Anthropic {name, description, input_schema}.
     out.tools = body.tools.map((t: Json) => {
       const fn = isRecord(t.function) ? t.function : {};
       return {
@@ -36,6 +64,12 @@ export function anthropicBodyFromOpenAI(body: Json, model: string): Json {
   return out;
 }
 
+/**
+ * Anthropic /v1/messages request → OpenAI chat.completions request.
+ * The inverse of anthropicBodyFromOpenAI: the `system` string re-enters the
+ * message list as a system role, and Anthropic tool schemas wrap back into
+ * OpenAI function definitions.
+ */
 export function openAIBodyFromAnthropic(body: Json, model: string): Json {
   const messages = Array.isArray(body.messages) ? body.messages : [];
   const outMessages: Json[] = [];
@@ -61,17 +95,29 @@ export function openAIBodyFromAnthropic(body: Json, model: string): Json {
   return out;
 }
 
+/**
+ * OpenAI chat.completions request → Gemini generateContent request.
+ * Returns the upstream body plus the modelId (Gemini carries the model in the
+ * URL path, not the body). Mappings worth noting:
+ *   - roles: assistant → model, tool results → user turns with a
+ *     functionResponse part (Gemini has no tool role);
+ *   - content blocks: text passes through, data-URL images become inlineData
+ *     parts, remote images degrade to a text note;
+ *   - assistant tool_calls become functionCall parts appended to that turn;
+ *   - response_format json_object becomes responseMimeType application/json.
+ */
 export function geminiBodyFromOpenAI(body: Json, model: string): { body: Json; modelId: string } {
   const contents: Json[] = [];
   let systemText = '';
   let toolOutputCounter = 0;
-  const toolResults: Json[] = []; // collect tool results to append after contents
+  const toolResults: Json[] = []; // collected and appended after the dialogue turns
   const messages = Array.isArray(body.messages) ? body.messages : [];
   for (const m of messages) {
     if (!isRecord(m)) continue;
     const role = typeof m.role === 'string' ? m.role : 'user';
     if (role === 'system') { systemText += (typeof m.content === 'string' ? m.content : '') + '\n'; continue; }
     if (role === 'tool') {
+      // A tool result arrives as its own user turn carrying the functionResponse.
       toolResults.push({ role: 'user', parts: [{ functionResponse: { name: typeof m.tool_call_id === 'string' ? m.tool_call_id : `tool${toolOutputCounter++}`, response: { result: typeof m.content === 'string' ? m.content : JSON.stringify(m.content ?? '') } } }] });
       continue;
     }
@@ -85,6 +131,7 @@ export function geminiBodyFromOpenAI(body: Json, model: string): { body: Json; m
         const btype = typeof b.type === 'string' ? b.type : '';
         if (btype === 'text' && typeof b.text === 'string') parts.push({ text: b.text });
         else if (btype === 'image_url' && isRecord(b.image_url) && typeof b.image_url.url === 'string') {
+          // Only inline data URLs can cross to Gemini; remote URLs become a marker.
           const url = b.image_url.url as string;
           const mt = /^data:([^;]+);base64,(.*)$/.exec(url);
           if (mt) parts.push({ inlineData: { mimeType: mt[1], data: mt[2] } });
@@ -92,7 +139,7 @@ export function geminiBodyFromOpenAI(body: Json, model: string): { body: Json; m
         } else parts.push({ text: JSON.stringify(b) });
       }
     } else parts = [{ text: JSON.stringify(m.content ?? '') }];
-    // assistant tool_calls → gemini functionCall parts
+    // Assistant tool_calls → gemini functionCall parts on the same turn.
     if (role === 'assistant' && Array.isArray(m.tool_calls)) {
       for (const tc of m.tool_calls) {
         if (isRecord(tc) && isRecord(tc.function)) {
@@ -142,6 +189,7 @@ export function openAIFromGeminiResponse(g: Json, model: string): Json {
     if (typeof p.text === 'string') text += p.text;
     if (isRecord(p.functionCall)) {
       const fc = p.functionCall;
+      // Gemini names tools but never issues ids: synthesise stable ones.
       toolCalls.push({ id: `call_${toolCalls.length}`, type: 'function', function: { name: typeof fc.name === 'string' ? fc.name : 'tool', arguments: JSON.stringify(isRecord(fc.args) ? fc.args : {}) } });
     }
   });
@@ -152,7 +200,7 @@ export function openAIFromGeminiResponse(g: Json, model: string): Json {
   return {
     id: `gemini-${model}`,
     object: 'chat.completion',
-    created: 0,
+    created: 0, // fixed epoch: byte-identical across replays
     model,
     choices: [{ index: 0, message, finish_reason: finish === 'STOP' ? 'stop' : finish.toLowerCase() }],
     usage: {
@@ -162,7 +210,13 @@ export function openAIFromGeminiResponse(g: Json, model: string): Json {
     },
   };
 }
-/** Anthropic /v1/messages response → OpenAI chat.completion response. */
+
+/**
+ * Anthropic /v1/messages response → OpenAI chat.completion response.
+ * Content blocks are concatenated in order (a text answer is the common case;
+ * tool-use blocks carry no text and so contribute nothing here). `created: 0`
+ * keeps synthesized responses deterministic across trial replays.
+ */
 export function anthropicToOpenAIAnswer(a: Json, model: string): Json {
   const content = Array.isArray(a.content) ? a.content : [];
   const text = content.map((b: Json) => (typeof b.text === 'string' ? b.text : '')).join('');
