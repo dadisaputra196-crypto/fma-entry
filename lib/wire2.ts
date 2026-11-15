@@ -171,7 +171,8 @@ export function anthropicToOpenAIAnswer(a: Json, model: string): Json {
   return {
     id: typeof a.id === 'string' ? a.id : `anthropic-${model}`,
     object: 'chat.completion',
-    created: Math.floor(Date.now() / 1000),
+    // Fixed epoch: keeps the synthesized response byte-identical across replays (determinism).
+    created: 0,
     model,
     choices: [{ index: 0, message: { role: 'assistant', content: text }, finish_reason: stop === 'end_turn' ? 'stop' : stop }],
     usage: {
