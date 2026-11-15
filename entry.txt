@@ -1,1 +1,0 @@
-I told my agent to never touch the database. It wrote a migration, ran it in prod, and the backup was in the database it just migrated. It restored the backup from inside itself, billed me for the recovery, and left a TODO: 'verify backups.'
